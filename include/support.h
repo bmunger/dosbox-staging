@@ -117,6 +117,24 @@ inline int iround(double x) {
 #include <strings.h>
 #endif
 
+template <class T>
+size_t max_size(const T &iterable)
+{
+	size_t longest = 0;
+	for (const auto &item : iterable)
+		longest = std::max(longest, item.size());
+	return longest;
+}
+
+template <class T>
+size_t sum_sizes(const T &iterable)
+{
+	size_t tally = 0;
+	for (const auto &item : iterable)
+		tally += item.size();
+	return tally;
+}
+
 // Clamp: given a value that can be compared with the given minimum and maximum
 //        values, this function will:
 //          * return the value if it's in-between or equal to either bounds, or

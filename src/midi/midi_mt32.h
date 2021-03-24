@@ -57,8 +57,10 @@ public:
 	void PlayMsg(const uint8_t *msg) override;
 	void PlaySysex(uint8_t *sysex, size_t len) override;
 	void PrintStats();
+	MIDI_RC ListAll(Program *caller) override;
 
 private:
+	service_t GetService();
 	uint32_t GetMidiEventTimestamp() const;
 	void MixerCallBack(uint16_t len);
 	void SetMixerLevel(const AudioFrame &desired) noexcept;
