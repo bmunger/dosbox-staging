@@ -27,6 +27,8 @@
 #include <cassert>
 #include <deque>
 #include <functional>
+#include <map>
+#include <set>
 #include <string>
 
 #include <SDL_endian.h>
@@ -39,6 +41,7 @@
 #include "mixer.h"
 #include "string_utils.h"
 #include "support.h"
+#include "../ints/int10.h"
 
 // mt32emu Settings
 // ----------------
@@ -252,30 +255,36 @@ static std::deque<std::string> get_selected_dirs()
 	        control->GetSection("mt32"));
 	assert(section);
 
-	// Get potential ROM directories from the environment
-	// and/or system
+	// Get potential ROM directories from the environment and/or system
 	auto rom_dirs = get_rom_dirs();
 
-	// Get the user's configured ROM directory; otherwise
-	// use 'mt32-roms'
+	// Get the user's configured ROM directory; otherwise use 'mt32-roms'
 	std::string selected_romdir = section->Get_string("romdir");
 	if (selected_romdir.empty()) // already trimmed
 		selected_romdir = "mt32-roms";
 	if (selected_romdir.back() != '/' && selected_romdir.back() != '\\')
 		selected_romdir += CROSS_FILESPLIT;
 
-	// Make sure we search the user's configured directory
-	// first
+	// Make sure we search the user's configured directory first
 	rom_dirs.emplace_front(CROSS_ResolveHome((selected_romdir)));
 	return rom_dirs;
 }
 
 static const char *get_selected_model()
 {
-	Section_prop *section = static_cast<Section_prop *>(
-	        control->GetSection("mt32"));
+	Section_prop *section = static_cast<Section_prop *>(control->GetSection("mt32"));
 	assert(section);
 	return section->Get_string("model");
+}
+
+static std::set<const LASynthModel *> has_models(const MidiHandler_mt32::service_t &service,
+                                                 const std::string &dir)
+{
+	std::set<const LASynthModel *> models = {};
+	for (const auto &model : all_models)
+		if (model->InDir(service, dir))
+			models.insert(model);
+	return models;
 }
 
 static std::string load_model(const MidiHandler_mt32::service_t &service,
@@ -360,6 +369,132 @@ MidiHandler_mt32::service_t MidiHandler_mt32::GetService()
 	if (!mt32_service->getContext())
 		mt32_service->createContext(get_report_handler_interface(), this);
 	return mt32_service;
+}
+
+// Calculates the maximum width available to print the rom directory, given
+// the terminal's width, indent size, and space needed for the model names:
+// [indent][max_dir_width][N columns + N delimeters]
+static size_t get_max_dir_width(const LASynthModel *(&models_without_aliases)[10],
+                                const char *indent,
+                                const char *column_delim)
+{
+	const size_t column_delim_width = strlen(column_delim);
+	size_t header_width = strlen(indent);
+	for (const auto &model : models_without_aliases)
+		header_width += strlen(model->GetVersion()) + column_delim_width;
+
+	const size_t term_width = INT10_GetTextColumns() - column_delim_width;
+	assert(term_width > header_width);
+	const auto max_dir_width = term_width - header_width;
+	return max_dir_width;
+}
+
+// Returns the set of models supported by all of the directories, and also
+// populates the provide map of the modules supported by each directory.
+static std::set<const LASynthModel *> populate_available_models(
+        const MidiHandler_mt32::service_t &service,
+        std::map<std::string, std::set<const LASynthModel *>> &dirs_with_models)
+{
+	std::set<const LASynthModel *> available_models;
+	for (const std::string &dir : get_selected_dirs()) {
+		const auto models = has_models(service, dir);
+		if (!models.empty()) {
+			dirs_with_models[dir] = models;
+			available_models.insert(models.begin(), models.end());
+		}
+	}
+	return available_models;
+}
+
+// Prints a table of directories and supported models. Models are printed
+// across the first row and directories are printed down the left column.
+// Long directories are truncated and model versions are used to avoid text
+// wrapping.
+MIDI_RC MidiHandler_mt32::ListAll(Program *caller)
+{
+	// Table layout constants
+	constexpr char indent[] = "  ";
+	constexpr char column_delim[] = " ";
+	constexpr char trailing_dots[] = "..";
+
+	const LASynthModel *models_without_aliases[] = {
+	        &cm32l_any_model,  &cm32l_102_model, &cm32l_100_model,
+	        &mt32_any_model,   &mt32_204_model,  &mt32_107_model,
+	        &mt32_bluer_model, &mt32_106_model,  &mt32_105_model,
+	        &mt32_104_model};
+
+	const size_t max_dir_width = get_max_dir_width(models_without_aliases,
+	                                               indent, column_delim);
+	const size_t truncated_dir_width = max_dir_width - strlen(trailing_dots);
+	assert(truncated_dir_width < max_dir_width);
+
+	// Get the set of directories and the models they support
+	std::map<std::string, std::set<const LASynthModel *>> dirs_with_models;
+	const auto available_models = populate_available_models(GetService(),
+	                                                        dirs_with_models);
+	if (available_models.empty()) {
+		caller->WriteOut("  No supported models present.");
+		return MIDI_RC::OK;
+	}
+
+	// Text colors and highlight selector
+	constexpr char gray[] = "\033[30;1m";
+	constexpr char green[] = "\033[32;1m";
+	constexpr char nocolor[] = "\033[0m";
+	auto get_highlight = [&](bool is_missing, bool is_matching) {
+		return is_missing ? gray : is_matching ? green : nocolor;
+	};
+
+	// Print the header row of all models
+	const std::string selected_model = get_selected_model();
+	const std::string dirs_padding(max_dir_width, ' ');
+	caller->WriteOut("%s%s", indent, dirs_padding.c_str());
+	for (const auto &model : models_without_aliases) {
+		const bool is_missing = (available_models.find(model) == available_models.end());
+		const bool is_selected = (selected_model == model->GetName());
+
+		const auto color = get_highlight(is_missing, is_selected);
+		caller->WriteOut("%s%s%s%s", color, model->GetVersion(),
+		                 nocolor, column_delim);
+	}
+	caller->WriteOut("\n");
+
+	// Print the directories and the model(s) they support
+	int num_matches = 0;
+	for (const auto &dir_and_models : dirs_with_models) {
+		const std::string &dir = dir_and_models.first;
+		const auto &dir_models = dir_and_models.second;
+
+		// Print the directory either truncated if too long
+		if (dir.size() > max_dir_width) {
+			const auto truncated_dir = dir.substr(0, truncated_dir_width);
+			caller->WriteOut("%s%s%s", indent, truncated_dir.c_str(), trailing_dots);
+		}
+		// or in-full with padded
+		else {
+			const auto pad_width = max_dir_width - dir.size();
+			const auto dir_padding = std::string(pad_width, ' ');
+			caller->WriteOut("%s%s%s", indent, dir.c_str(), dir_padding.c_str());
+		}
+		// Print an indicator of the directory has the model
+		const auto delim_width = strlen(column_delim);
+		for (const auto &model : models_without_aliases) {
+			const auto column_width = strlen(model->GetVersion());
+			std::string textbox(column_width + delim_width, ' ');
+			assert(textbox.size() > 2);
+			const size_t text_center = (textbox.size() / 2) - 1;
+
+			const bool is_missing = (dir_models.find(model) == dir_models.end());
+			const bool is_first_match = (selected_model == model->GetName()) &&
+			                            !is_missing && !num_matches++;
+
+			textbox[text_center] = is_missing ? '-' : 'y';
+			const auto color = get_highlight(is_missing, is_first_match);
+			caller->WriteOut("%s%s%s", color, textbox.c_str(), nocolor);
+		}
+		caller->WriteOut("\n");
+	}
+	return MIDI_RC::OK;
 }
 
 bool MidiHandler_mt32::Open(MAYBE_UNUSED const char *conf)
